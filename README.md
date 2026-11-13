@@ -1,3 +1,5 @@
+> **定制 fork**：本仓库基于 [Alcpare/maibot_identity_plugin](https://github.com/Alcpare/maibot_identity_plugin)。定制代码位于 `local/custom`，功能差异和安装限制见 [本地改动说明](LOCAL_CHANGES.md)。原作者及许可证保留。
+
 # 身份认知插件（Alcpare.identity）
 
 让她知道**当前跟她说话的人是谁**（主人 / 朋友 / 群友），从而用对态度。
@@ -189,4 +191,20 @@ python tests/test_v103.py              # 兜底文件损坏不炸 + default_labe
 
 ### v1.0.0
 - 首个版本：手动白名单身份认知（主人 / 朋友 / 群友），按消息 ID 精确定位、同轮去重、通知事件过滤、映射落盘
+
+
+## 本地动态关系联动（1.1.0）
+
+`[dynamic_relationship] enabled = true` 时读取印象卡片的公开只读关系 API。`identity.roster` 是手动锁定名单，主人、朋友和群友均可填写；手动条目始终优先，未锁定的人使用动态关系。
+
+Planner 与 Replyer 对同一条消息使用同一关系快照，评分变化从下一轮生效。接口异常会记录警告并保持已知档位；动态来源禁止产生主人身份。保存手动名单立即生效。
+
+插件由 MaiBot 托管，启停通过 WebUI，依赖 `com.0-hz.impression-card >= 0.4.0`。
+# 本机统一关系接口
+
+`Alcpare.identity.get_relationship(platform, user_id)` 提供按平台账号核实的人工身份、
+动态关系和印象卡片原始好感，不依赖是否缓存了最近一条用户消息。
+主人权限仅来自人工名单，高好感不会授予主人身份。
+此接口供 Mai_life 的私聊、主动分享、日记与书柜权限使用；
+评分仍统一存放于印象卡片，原人工名单和动态升降阈值保持有效。
 

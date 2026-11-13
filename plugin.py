@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import hashlib
 import json
 import os
@@ -31,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase
+from maibot_sdk import API, Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 # ── 常量 ──────────────────────────────────────────────────────────────
@@ -140,7 +141,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.0.0", description="配置版本")
+    config_version: str = Field(default="1.1.0", description="配置版本")
 
 
 class IdentitySectionConfig(PluginConfigBase):
@@ -161,7 +162,7 @@ class IdentitySectionConfig(PluginConfigBase):
             "# 100000001 = 主人\n"
             "# 100000002 = 朋友\n"
         ),
-        description="白名单：每行「QQ号 = 档位（主人/朋友）」，# 开头为注释；保存即生效",
+        description="手动锁定名单：每行「QQ号 = 主人/朋友/群友」；名单中的关系不会被自动升降覆盖，保存即生效",
     )
 
     # ── 2. 三档的态度与关心程度（想调她的分寸就改这里）────────────
@@ -192,11 +193,23 @@ class IdentitySectionConfig(PluginConfigBase):
     log_injections: bool = Field(default=True, description="把每次注入记入日志（便于核对效果）")
 
 
+class DynamicRelationshipConfig(PluginConfigBase):
+    """印象评分只决定非手动名单成员的动态关系。"""
+
+    __ui_label__ = "印象卡片联动"
+    __ui_icon__ = "users"
+    __ui_order__ = 2
+
+    enabled: bool = Field(default=False, description="从印象卡片读取自动关系；手动名单始终优先")
+    timeout_ms: int = Field(default=2000, ge=100, le=4000, description="关系查询等待上限；失败时保留已知关系并记录警告")
+
+
 class IdentityPluginConfig(PluginConfigBase):
     """身份认知插件配置。"""
 
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     identity: IdentitySectionConfig = Field(default_factory=IdentitySectionConfig)
+    dynamic_relationship: DynamicRelationshipConfig = Field(default_factory=DynamicRelationshipConfig)
 
 
 # ── 插件主体 ──────────────────────────────────────────────────────────
@@ -216,6 +229,8 @@ class IdentityPlugin(MaiBotPlugin):
         self._warned_no_target = False
         self._last_save = 0.0
         self._data_file = None
+        self._dynamic_labels: Dict[Tuple[str, str], str] = {}
+        self._relationship_turns: Dict[str, Tuple[float, str, bool]] = {}
 
     # ── 生命周期 ──────────────────────────────────────────────────────
 
@@ -224,6 +239,9 @@ class IdentityPlugin(MaiBotPlugin):
 
         self._rebuild_roster()
         self._load_persisted()
+        if self.config.dynamic_relationship.enabled:
+            await self._query_relationship("qq", "")
+            self.ctx.logger.info("[身份] 动态关系接口已连接；主人和全部手动名单项保持锁定")
         data_file = self._resolve_data_file()
         try:
             file_note = (
@@ -251,12 +269,16 @@ class IdentityPlugin(MaiBotPlugin):
         self._recent.clear()
         self._latest_by_session.clear()
         self._labels.clear()
+        self._dynamic_labels.clear()
+        self._relationship_turns.clear()
 
     async def on_config_update(self, scope: str, config_data: dict[str, object], version: str) -> None:
         """配置热重载：重新解析名单，改动立即生效。"""
 
         del scope, config_data, version
         self._rebuild_roster()
+        self._dynamic_labels.clear()
+        self._relationship_turns.clear()
         self.ctx.logger.info(f"[身份] 名单已刷新：{len(self._labels)} 人")
 
     # ── 名单解析 ──────────────────────────────────────────────────────
@@ -286,7 +308,7 @@ class IdentityPlugin(MaiBotPlugin):
                 labels[qq] = label
         self._labels = labels
 
-    def _label_for(self, user_id: str) -> Tuple[str, bool]:
+    def _label_for(self, user_id: str, platform: str = "qq") -> Tuple[str, bool]:
         """返回 (档位, 是否命中名单)。
 
         名单外的档位取配置里的 ``default_label``，但**必须先校验**：
@@ -294,9 +316,14 @@ class IdentityPlugin(MaiBotPlugin):
         填了「群主」这类未支持的档位时要回落成默认档，而不是把无效值写进提示词。
         """
 
-        label = self._labels.get(str(user_id))
+        platform = self._relationship_platform(platform)
+        label = self._labels.get(str(user_id)) if platform == "qq" else None
         if label:
             return label, True
+        if self.config.dynamic_relationship.enabled:
+            label = self._dynamic_labels.get((platform, str(user_id)))
+            if label in {"朋友", "群友"}:
+                return label, True
         default = str(self.config.identity.default_label or "").strip()
         if default not in _LABEL_RULES:
             if default and not getattr(self, "_default_label_warned", False):
@@ -306,6 +333,104 @@ class IdentityPlugin(MaiBotPlugin):
                 )
             default = _DEFAULT_LABEL
         return default, False
+
+    @staticmethod
+    def _relationship_platform(platform: str) -> str:
+        value = str(platform or "qq").strip().lower()
+        return "qq" if value in {"napcat", "snowluma"} else value
+
+    async def _query_relationship(self, platform: str, user_id: str) -> dict:
+        value = await asyncio.wait_for(
+            self.ctx.api.call(
+                "com.0-hz.impression-card.get_relationship", platform=platform, user_id=user_id,
+            ), timeout=self.config.dynamic_relationship.timeout_ms / 1000.0,
+        )
+        # API calls may include the Host's standard success/result envelope.
+        for _ in range(4):
+            if not isinstance(value, dict):
+                break
+            if value.get("success") is False:
+                raise RuntimeError(str(value.get("error") or "关系接口调用失败"))
+            if value.get("schema_version") == 1 and value.get("ready") is True:
+                if value.get("label") not in {"朋友", "群友"}:
+                    raise ValueError("动态关系接口返回了不允许的身份")
+                return value
+            value = value.get("result")
+        raise ValueError("动态关系接口返回格式无效")
+
+    async def _prepare_dynamic_relationship(self, kwargs: dict) -> None:
+        if not self.config.plugin.enabled or not self.config.dynamic_relationship.enabled:
+            return
+        latest = self._latest_by_session.get(str(kwargs.get("session_id") or "").strip())
+        if isinstance(latest, dict) and latest.get("is_notify"):
+            return
+        speaker = self._current_speaker(kwargs.get("items"))
+        if speaker is None:
+            speaker = self._speaker_by_session(kwargs.get("session_id"))
+        if not speaker:
+            return
+        platform = self._relationship_platform(speaker.get("platform", "qq"))
+        user_id = str(speaker["user_id"])
+        # Never ask the scoring plugin to overwrite a manual assignment.
+        if platform == "qq" and user_id in self._labels:
+            return
+        turn_id = self._last_message_id(kwargs.get("items")) or str(speaker.get("ts", ""))
+        key = f"{kwargs.get('session_id', '')}|{platform}|{user_id}|{turn_id}"
+        now = time.time()
+        self._relationship_turns = {
+            k: v for k, v in self._relationship_turns.items() if now - v[0] < _INJECT_DEDUPE_TTL
+        }
+        cached = self._relationship_turns.get(key)
+        if cached is None:
+            try:
+                value = await self._query_relationship(platform, user_id)
+                label = value["label"]
+                known = bool(value.get("found") and value.get("enabled") and not value.get("protected"))
+                cached = (now, label, known)
+                self._relationship_turns[key] = cached
+                if len(self._relationship_turns) > _RECENT_LIMIT:
+                    del self._relationship_turns[min(self._relationship_turns, key=lambda k: self._relationship_turns[k][0])]
+            except Exception as exc:
+                held = self._dynamic_labels.get((platform, user_id))
+                self._relationship_turns[key] = (now, held or "群友", held is not None)
+                safe_error = _LONG_DIGITS_RE.sub(lambda match: self._mask_id(match.group()), str(exc))
+                self.ctx.logger.warning(
+                    "[身份] 动态关系查询失败，保留已知身份 user=%s: %s",
+                    self._mask_id(user_id), safe_error,
+                )
+                return
+        _, label, known = cached
+        identity_key = (platform, user_id)
+        previous = self._dynamic_labels.pop(identity_key, None)
+        if known:
+            self._dynamic_labels[identity_key] = label
+            if previous != label:
+                self.ctx.logger.info("[身份] 动态关系生效 user=%s → %s", self._mask_id(user_id), label)
+        if len(self._dynamic_labels) > _RECENT_LIMIT:
+            del self._dynamic_labels[next(iter(self._dynamic_labels))]
+
+    @API("get_relationship", description="按用户读取手动身份、动态关系和原始好感；主动任务不依赖聊天消息缓存", public=True)
+    async def relationship_api(self, platform: str = "qq", user_id: str = "") -> dict[str, Any]:
+        platform = self._relationship_platform(platform)
+        user_id = str(user_id).strip()
+        if not self.config.plugin.enabled or not user_id:
+            raise ValueError("身份插件未启用或未指定用户")
+        value = await self._query_relationship(platform, user_id)
+        manual = self._labels.get(user_id) if platform == "qq" else None
+        if manual:
+            label, source = manual, "manual"
+        elif self.config.dynamic_relationship.enabled and value.get("enabled") and value.get("found") and not value.get("protected"):
+            label, source = value["label"], "impression_card"
+        else:
+            label, source = _DEFAULT_LABEL, "default"
+        if not isinstance(value.get("affinity"), dict):
+            raise ValueError("好感度接口未提供档案状态；请检查印象卡片版本")
+        return {
+            "schema_version": 1, "ready": True, "platform": platform, "user_id": user_id,
+            "label": label, "role": "owner" if manual == "主人" else "friend",
+            "source": source, "manual": bool(manual), "affinity": value["affinity"],
+            "outreach": value.get("outreach"),
+        }
 
     def _style_for(self, label: str) -> str:
         """按档位取「态度 + 关心程度」文案（来自配置，可在面板里改）。"""
@@ -391,6 +516,7 @@ class IdentityPlugin(MaiBotPlugin):
 
             record = {
                 "user_id": user_id,
+                "platform": self._relationship_platform(message.get("platform") or "qq"),
                 "name": display_name,
                 "session": session_id,
                 "group": str(group_info.get("group_id") or ""),
@@ -543,6 +669,7 @@ class IdentityPlugin(MaiBotPlugin):
         """planner 侧注入。"""
 
         self._diag_dump(kwargs.get("items"))
+        await self._prepare_dynamic_relationship(kwargs)
         return self._handle_injection(kwargs, stage="planner")
 
     @HookHandler(
@@ -556,6 +683,7 @@ class IdentityPlugin(MaiBotPlugin):
     async def inject_to_replyer(self, **kwargs: Any) -> dict:
         """replyer 侧注入。"""
 
+        await self._prepare_dynamic_relationship(kwargs)
         return self._handle_injection(kwargs, stage="replyer")
 
     # ── 注入实现 ──────────────────────────────────────────────────────
@@ -606,7 +734,7 @@ class IdentityPlugin(MaiBotPlugin):
             self.ctx.logger.debug(f"[身份][跳过/{stage}] 本轮已注入过，跳过（key={dedupe_key}）")
             return base
 
-        label, listed = self._label_for(speaker["user_id"])
+        label, listed = self._label_for(speaker["user_id"], speaker.get("platform", "qq"))
         if not listed and not cfg.inject_for_others:
             self.ctx.logger.debug(
                 f"[身份][跳过/{stage}] 说话者不在名单（且只对名单内生效）："

@@ -1,15 +1,15 @@
 {
   "manifest_version": 2,
-  "version": "1.0.5",
+  "version": "1.2.0",
   "name": "身份认知",
-  "description": "手动白名单：让她知道当前对话者是主人 / 朋友 / 普通群友，从而用对态度。QQ 号只用于内部识别，永不进入提示词。",
+  "description": "手动身份锁定优先；从印象卡片读取动态关系与好感，通过统一接口向其他插件提供已核实的身份权限。",
   "author": {
     "name": "Alcpare",
     "url": "https://github.com/Alcpare"
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://github.com/Alcpare/maibot_identity_plugin",
+    "repository": "https://github.com/krkr521/maibot_identity_plugin",
     "homepage": "https://github.com/Alcpare/maibot_identity_plugin",
     "documentation": "https://github.com/Alcpare/maibot_identity_plugin/blob/main/README.md",
     "issues": "https://github.com/Alcpare/maibot_identity_plugin/issues"
@@ -23,8 +23,16 @@
     "min_version": "2.9.0",
     "max_version": "2.99.99"
   },
-  "dependencies": [],
-  "capabilities": [],
+  "dependencies": [
+    {
+      "type": "plugin",
+      "id": "com.0-hz.impression-card",
+      "version_spec": ">=0.5.0"
+    }
+  ],
+  "capabilities": [
+    "api.call"
+  ],
   "i18n": {
     "default_locale": "zh-CN",
     "supported_locales": [
